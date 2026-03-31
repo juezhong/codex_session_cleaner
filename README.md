@@ -102,3 +102,4 @@ uv run codex-session-cleaner
 
 本项目基于 Apache License 2.0 发布。
 详见 [LICENSE](./LICENSE)。
+附加归属说明见 [NOTICE](./NOTICE)。
