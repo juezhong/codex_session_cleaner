@@ -16,13 +16,23 @@ uv --version
 
 - 安装说明：<https://docs.astral.sh/uv/getting-started/installation/>
 
-常见安装方式：
+macOS / Linux:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-安装完成后重新打开终端，或者确认 `uv` 已经进入 `PATH`。
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+安装完成后重新打开终端，或者确认 `uv` 已经进入 `PATH`：
+
+```bash
+uv --version
+```
 
 ## 启动
 
@@ -32,16 +42,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 cd /path/to/codex-session-cleaner
 ```
 
-同步依赖：
-
-```bash
-uv sync --extra dev
-```
-
-启动程序：
+可以直接用一条命令启动程序：
 
 ```bash
 uv run codex-session-cleaner
+```
+
+`uv run` 会在需要时自动创建并使用项目虚拟环境（通常是 `.venv`），并按项目配置准备运行所需依赖。
+
+如果你还需要安装开发依赖，可以额外执行：
+
+```bash
+uv sync --extra dev
 ```
 
 ## 数据位置
