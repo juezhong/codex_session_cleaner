@@ -6,7 +6,17 @@ build-backend = "setuptools.build_meta"
 name = "codex-session-cleaner"
 version = "0.1.0"
 description = "Textual TUI for reviewing and trashing local Codex sessions"
+readme = "README.md"
 requires-python = ">=3.11"
+license = {file = "LICENSE"}
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
 dependencies = [
   "textual>=0.62,<1.0",
 ]
@@ -21,6 +31,7 @@ codex-session-cleaner = "codex_session_cleaner.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

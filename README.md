@@ -97,3 +97,8 @@ uv run codex-session-cleaner
 
 - 首次启动如果 session 很多，会比较慢，这是因为要扫描并解析本地 `rollout-*.jsonl`
 - 之后删除返回主界面会快很多，因为优先走内存增量更新
+
+## 许可证
+
+本项目基于 Apache License 2.0 发布。
+详见 [LICENSE](./LICENSE)。

@@ -1,3 +1,6 @@
+# Copyright 2026 liyunfeng
+# Licensed under the Apache License, Version 2.0
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
