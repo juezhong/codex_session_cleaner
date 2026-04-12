@@ -15,15 +15,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from codex_session_cleaner.models import SessionParseResult, SessionRecord
-
-ROLLUP_GLOB = "rollout-*.jsonl"
+from codex_session_cleaner.models import ConversationRound, SessionParseResult, SessionRecord
 
 
 def get_session_root() -> Path:
@@ -39,10 +38,30 @@ def discover_sessions(session_root: Path | None = None) -> list[SessionRecord]:
     if not root.exists():
         return []
 
-    records = [parse_session_file(path).record for path in root.rglob(ROLLUP_GLOB) if path.is_file()]
+    records: list[SessionRecord] = []
+    for path in _iter_rollup_files(root):
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
+            continue
+        try:
+            records.append(parse_session_file(path).record)
+        except OSError:
+            continue
     records.sort(key=lambda record: str(record.jsonl_path))
     records.sort(key=lambda record: record.updated_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return records
+
+
+def _iter_rollup_files(root: Path) -> Iterator[Path]:
+    def _onerror(exc: OSError) -> None:
+        return None
+
+    for dirpath, _, filenames in os.walk(root, onerror=_onerror):
+        for filename in filenames:
+            if filename.startswith("rollout-") and filename.endswith(".jsonl"):
+                yield Path(dirpath) / filename
 
 
 def parse_session_file(path: Path) -> SessionParseResult:
@@ -51,13 +70,18 @@ def parse_session_file(path: Path) -> SessionParseResult:
     cwd: str | None = None
     session_kind = "main"
     session_label: str | None = None
-    rollout_snippets: list[str] = []
+    rollout_messages: list[tuple[str, str]] = []
     event_timestamps: list[datetime] = []
     saw_valid_json_object = False
 
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, raw_line in enumerate(handle, start=1):
+        with path.open("rb") as handle:
+            for line_number, raw_raw in enumerate(handle, start=1):
+                try:
+                    raw_line = raw_raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    warnings.append(f"line {line_number}: invalid UTF-8: {exc}")
+                    raw_line = raw_raw.decode("utf-8", errors="replace")
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -88,12 +112,14 @@ def parse_session_file(path: Path) -> SessionParseResult:
                         warnings.append(f"line {line_number}: cwd {cwd_candidate!r} disagrees with {cwd!r}")
 
                 kind_candidate, label_candidate = _extract_session_identity(parsed)
-                if kind_candidate is not None:
+                if kind_candidate == "subagent":
+                    session_kind = "subagent"
+                elif session_kind != "subagent" and kind_candidate is not None:
                     session_kind = kind_candidate
                 if label_candidate is not None:
                     session_label = label_candidate
 
-                rollout_snippets.extend(_extract_rollout_preview_snippets(parsed))
+                rollout_messages.extend(_extract_rollout_messages(parsed))
                 event_timestamp = _first_parseable_timestamp(parsed)
                 if event_timestamp is not None:
                     event_timestamps.append(event_timestamp)
@@ -119,7 +145,7 @@ def parse_session_file(path: Path) -> SessionParseResult:
             updated_at = fallback
             warnings.append("no parseable timestamps found; used file mtime")
 
-    conversation_preview = _build_conversation_preview(session_id, rollout_snippets)
+    conversation_rounds = _build_conversation_rounds(session_id, rollout_messages)
     record = SessionRecord(
         session_id=session_id or "unknown",
         cwd=cwd,
@@ -129,7 +155,7 @@ def parse_session_file(path: Path) -> SessionParseResult:
         display_label=_build_display_label(cwd, session_id),
         session_kind=session_kind,
         session_label=session_label,
-        conversation_preview=conversation_preview,
+        conversation_rounds=conversation_rounds,
         warnings=warnings,
     )
     return SessionParseResult(record=record)
@@ -141,18 +167,54 @@ def _build_display_label(cwd: str | None, session_id: str | None) -> str:
     return f"{cwd_label} · {short_session_id}"
 
 
-def _build_conversation_preview(session_id: str | None, rollout_snippets: list[str]) -> tuple[str, ...]:
-    if rollout_snippets:
-        return tuple(rollout_snippets[:15])
-
-    history_snippets = _history_snippets_for_session(session_id)
-    if history_snippets:
-        return tuple(f"user: {snippet}" for snippet in history_snippets[:15])
-
-    return tuple()
+def _build_conversation_rounds(session_id: str | None, rollout_messages: list[tuple[str, str]]) -> tuple[ConversationRound, ...]:
+    rounds = _rounds_from_rollout_messages(rollout_messages)
+    if rounds:
+        return tuple(rounds)
+    history_rounds = _rounds_from_history(session_id)
+    return tuple(history_rounds)
 
 
-def _history_snippets_for_session(session_id: str | None) -> list[str]:
+def _rounds_from_rollout_messages(rollout_messages: list[tuple[str, str]]) -> list[ConversationRound]:
+    rounds: list[ConversationRound] = []
+    current_user: str | None = None
+    assistant_messages: list[str] = []
+    for role, text in rollout_messages:
+        if role == "user":
+            if current_user is not None:
+                rounds.append(
+                    ConversationRound(
+                        user_text=current_user,
+                        assistant_text=_combine_assistant_messages(assistant_messages),
+                    )
+                )
+            current_user = text
+            assistant_messages = []
+        elif role == "assistant":
+            if current_user is None:
+                continue
+            assistant_messages.append(text)
+    if current_user is not None:
+        rounds.append(
+            ConversationRound(
+                user_text=current_user,
+                assistant_text=_combine_assistant_messages(assistant_messages),
+            )
+        )
+    return rounds
+
+
+def _combine_assistant_messages(messages: list[str]) -> str | None:
+    if not messages:
+        return None
+    return "\n\n".join(messages)
+
+
+def _rounds_from_history(session_id: str | None) -> list[ConversationRound]:
+    return [ConversationRound(user_text=snippet) for snippet in _history_messages_for_session(session_id)]
+
+
+def _history_messages_for_session(session_id: str | None) -> list[str]:
     if not session_id or session_id == "unknown":
         return []
 
@@ -167,8 +229,12 @@ def _history_entries_by_session(history_path: Path) -> dict[str, list[tuple[int,
 
     entries_by_session: dict[str, list[tuple[int, str]]] = {}
     try:
-        with history_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
+        with history_path.open("rb") as handle:
+            for raw_raw in handle:
+                try:
+                    line = raw_raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    line = raw_raw.decode("utf-8", errors="replace")
                 line = line.strip()
                 if not line:
                     continue
@@ -189,7 +255,10 @@ def _history_entries_by_session(history_path: Path) -> dict[str, list[tuple[int,
                 timestamp = _parse_history_timestamp(ts)
                 if timestamp is None:
                     continue
-                entries_by_session.setdefault(session_id, []).append((timestamp, _clean_preview_text(text)))
+                cleaned = _clean_message_text(text)
+                if cleaned is None:
+                    continue
+                entries_by_session.setdefault(session_id, []).append((timestamp, cleaned))
     except OSError:
         return {}
 
@@ -198,21 +267,37 @@ def _history_entries_by_session(history_path: Path) -> dict[str, list[tuple[int,
     return entries_by_session
 
 
+def clear_history_cache() -> None:
+    _history_entries_by_session.cache_clear()
+
+
 def _get_history_path() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home) / "history.jsonl"
     home = Path(os.environ.get("HOME", str(Path.home())))
     return home / ".codex" / "history.jsonl"
 
 
 def _parse_history_timestamp(value: int | float | str) -> int | None:
     if isinstance(value, (int, float)):
-        return int(value)
+        try:
+            numeric = float(value)
+        except (ValueError, OverflowError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return int(numeric)
     stripped = value.strip()
     if not stripped:
         return None
     try:
-        return int(float(stripped))
-    except ValueError:
+        numeric = float(stripped)
+    except (ValueError, OverflowError):
         return None
+    if not math.isfinite(numeric):
+        return None
+    return int(numeric)
 
 
 def _extract_session_id(parsed: dict[str, Any]) -> str | None:
@@ -247,7 +332,7 @@ def _extract_cwd(parsed: dict[str, Any]) -> str | None:
     return _first_non_empty_string(parsed.get("cwd"))
 
 
-def _extract_rollout_preview_snippets(parsed: dict[str, Any]) -> list[str]:
+def _extract_rollout_messages(parsed: dict[str, Any]) -> list[tuple[str, str]]:
     if parsed.get("type") != "response_item":
         return []
 
@@ -274,10 +359,17 @@ def _extract_rollout_preview_snippets(parsed: dict[str, Any]) -> list[str]:
     if not text_parts:
         return []
 
-    cleaned = _clean_preview_text(" ".join(text_parts))
+    cleaned = _clean_message_text(" ".join(text_parts))
     if cleaned is None:
         return []
-    return [f"{role}: {cleaned}"]
+    return [(role, cleaned)]
+
+
+def _clean_message_text(text: str) -> str | None:
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return None
+    return cleaned
 
 
 def _extract_session_identity(parsed: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -294,15 +386,6 @@ def _extract_session_identity(parsed: dict[str, Any]) -> tuple[str | None, str |
         return "subagent", label
 
     return "main", None
-
-
-def _clean_preview_text(text: str) -> str | None:
-    cleaned = " ".join(text.split())
-    if not cleaned:
-        return None
-    if len(cleaned) > 180:
-        cleaned = cleaned[:177].rstrip() + "..."
-    return cleaned
 
 
 def _short_session_id(session_id: str) -> str:
@@ -333,17 +416,44 @@ def _parse_timestamp_value(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
             return None
-        if stripped.isdigit():
-            return datetime.fromtimestamp(float(stripped), tz=timezone.utc)
+        if _is_numeric_string(stripped):
+            try:
+                return datetime.fromtimestamp(float(stripped), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
         normalized = stripped[:-1] + "+00:00" if stripped.endswith("Z") else stripped
         try:
             parsed = datetime.fromisoformat(normalized)
-        except ValueError:
+        except (ValueError, OverflowError):
             return None
         return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
     return None
+
+
+def _is_numeric_string(value: str) -> bool:
+    if not value:
+        return False
+    if value[0] in "+-":
+        value = value[1:]
+    if not value:
+        return False
+    dot_seen = False
+    digits_seen = False
+    for char in value:
+        if char == ".":
+            if dot_seen:
+                return False
+            dot_seen = True
+            continue
+        if not char.isdigit():
+            return False
+        digits_seen = True
+    return digits_seen

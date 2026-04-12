@@ -15,8 +15,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
+from typing import Type, TypeVar
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -25,9 +25,12 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Label, ListItem, ListView, Static
 
-from codex_session_cleaner.discovery import discover_sessions, get_session_root
+from codex_session_cleaner.detail_pane import DetailsPane
+from codex_session_cleaner.discovery import clear_history_cache, discover_sessions, get_session_root
 from codex_session_cleaner.models import SessionRecord
 from codex_session_cleaner.trash import TrashMoveResult, get_trash_root, trash_records
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,42 +53,13 @@ class ConfirmationData:
 def _format_row(record: SessionRecord, selected: bool) -> str:
     selection_marker = "[x]" if selected else "[ ]"
     cwd_label = record.cwd or "unknown"
-    updated_label = _format_datetime(record.updated_at)
     identity_label = _format_identity_label(record)
-    cleanup_error = _cleanup_error_message(record)
+    cleanup_error = _session_cleanup_error_message(record)
     header = f"{selection_marker} {cwd_label}"
-    if identity_label is not None:
-        header = f"{header}  |  {identity_label}"
-    header = f"{header}  |  {updated_label}"
+    header = f"{header}  |  {identity_label}"
     if cleanup_error is not None:
         header = f"{header}  {cleanup_error}"
     return header
-
-
-def _render_details(record: SessionRecord) -> str:
-    lines = [
-        f"cwd: {record.cwd or 'unknown'}",
-        f"type: {_format_identity_label(record) or 'main'}",
-        f"path: {record.jsonl_path}",
-        f"updated: {_format_datetime(record.updated_at)}",
-    ]
-    preview_lines = _format_detailed_preview(record.conversation_preview, limit=15)
-    if preview_lines:
-        lines.append("")
-        lines.append("conversation:")
-        lines.extend(f"- {preview}" for preview in preview_lines)
-    if record.warnings:
-        lines.append("")
-        lines.append("warnings:")
-        lines.extend(f"- {warning}" for warning in record.warnings)
-    return "\n".join(lines)
-
-
-def _format_datetime(value: datetime | None) -> str:
-    if value is None:
-        return "unknown"
-    return value.astimezone().isoformat(timespec="seconds")
-
 
 def _short_session_id(session_id: str) -> str:
     if session_id == "unknown":
@@ -93,18 +67,7 @@ def _short_session_id(session_id: str) -> str:
     return session_id[:8]
 
 
-def _format_detailed_preview(preview: tuple[str, ...], *, limit: int) -> list[str]:
-    snippets = _ordered_preview_snippets(preview, limit=limit)
-    return [snippet for snippet in snippets]
-
-
-def _ordered_preview_snippets(preview: tuple[str, ...], *, limit: int) -> tuple[str, ...]:
-    if not preview:
-        return tuple()
-    return preview[:limit]
-
-
-def _format_identity_label(record: SessionRecord) -> str | None:
+def _format_identity_label(record: SessionRecord) -> str:
     if record.session_kind == "subagent":
         if record.session_label:
             return f"subagent {record.session_label}"
@@ -112,7 +75,7 @@ def _format_identity_label(record: SessionRecord) -> str | None:
     return "main"
 
 
-def _cleanup_error_message(record: SessionRecord) -> str | None:
+def _session_cleanup_error_message(record: SessionRecord) -> str | None:
     for warning in record.warnings:
         if warning.startswith("cleanup error: "):
             return warning
@@ -161,13 +124,12 @@ class ConfirmationScreen(ModalScreen[bool]):
     def __init__(self, confirmation: ConfirmationData) -> None:
         super().__init__()
         self.confirmation = confirmation
-        self.selected_count = confirmation.selected_count
 
     def compose(self) -> ComposeResult:
         yield Vertical(
             Static(Text("[y] Confirm  [n] Cancel  [j/k] Scroll"), id="confirmation-shortcuts"),
             VerticalScroll(
-                Static(_render_confirmation_text(self.confirmation), id="confirmation-body"),
+                Static(_render_confirmation_text(self.confirmation), id="confirmation-body", markup=False),
                 id="confirmation-scroll",
             ),
             id="confirmation-dialog",
@@ -196,10 +158,12 @@ class CodexSessionCleanerApp(App[None]):
     CSS = """
     Screen {
         layout: vertical;
+        height: 100vh;
     }
 
     #toolbar {
-        height: auto;
+        height: 100%;
+        min-height: 0;
         padding: 0 1;
     }
 
@@ -218,7 +182,7 @@ class CodexSessionCleanerApp(App[None]):
         min-width: 30;
     }
 
-    #details {
+    #details-pane {
         width: 58%;
         padding: 0 1;
     }
@@ -241,7 +205,7 @@ class CodexSessionCleanerApp(App[None]):
             Static("", id="status-line"),
             Horizontal(
                 ListView(id="session-list"),
-                Static(self.get_empty_state_renderable(), id="details"),
+                DetailsPane(id="details-pane"),
                 id="main-pane",
             ),
             Footer(),
@@ -264,6 +228,14 @@ class CodexSessionCleanerApp(App[None]):
         if key == "r":
             event.stop()
             self._load_sessions()
+            return
+        if key == "pagedown":
+            event.stop()
+            self.scroll_details_page_down()
+            return
+        if key == "pageup":
+            event.stop()
+            self.scroll_details_page_up()
             return
         if key == "tab":
             event.stop()
@@ -295,6 +267,7 @@ class CodexSessionCleanerApp(App[None]):
             return
 
     def _load_sessions(self) -> None:
+        clear_history_cache()
         self.records = discover_sessions(self.session_root)
         self._merge_cleanup_failed_records()
         self._prune_selected_record_paths()
@@ -302,6 +275,16 @@ class CodexSessionCleanerApp(App[None]):
         if self.highlighted_record_path is None and self.visible_records:
             self.highlighted_record_path = self.visible_records[0].jsonl_path
         self._refresh_widgets()
+
+    def scroll_details_page_down(self) -> None:
+        details_pane = self._query_widget("#details-pane", DetailsPane)
+        if details_pane is not None:
+            details_pane.scroll_page_down(animate=False)
+
+    def scroll_details_page_up(self) -> None:
+        details_pane = self._query_widget("#details-pane", DetailsPane)
+        if details_pane is not None:
+            details_pane.scroll_page_up(animate=False)
 
     def _prune_selected_record_paths(self) -> None:
         valid_paths = {record.jsonl_path for record in self.records}
@@ -326,9 +309,13 @@ class CodexSessionCleanerApp(App[None]):
 
     def toggle_selection_for_highlighted_row(self) -> None:
         session_list = self._query_widget("#session-list", ListView)
-        record = self._record_for_path(self.highlighted_record_path)
-        if record is None and self.visible_records:
-            record = self.visible_records[0]
+        highlighted_item = self._highlighted_list_item(session_list)
+        if highlighted_item is not None:
+            record = highlighted_item.record
+        else:
+            record = self._record_for_path(self.highlighted_record_path)
+            if record is None and self.visible_records:
+                record = self.visible_records[0]
         if record is None:
             return
         if record.jsonl_path in self.selected_record_paths:
@@ -445,16 +432,28 @@ class CodexSessionCleanerApp(App[None]):
         self.apply_view_mode(refresh=False)
 
     def _record_from_confirmation(self, selection: ConfirmationSelection) -> SessionRecord:
+        existing = next((record for record in self.records if record.jsonl_path == selection.jsonl_path), None)
+        display_label = existing.display_label if existing is not None else f"{selection.cwd or 'unknown'} · {selection.short_session_id}"
+        session_kind = existing.session_kind if existing is not None else "main"
+        session_label = existing.session_label if existing is not None else None
+        conversation_rounds = existing.conversation_rounds if existing is not None else tuple()
+        created_at = existing.created_at if existing is not None else None
+        updated_at = existing.updated_at if existing is not None else None
+        warnings = list(existing.warnings) if existing is not None else []
         return SessionRecord(
             session_id=selection.session_id,
             cwd=selection.cwd,
             jsonl_path=selection.jsonl_path,
-            created_at=None,
-            updated_at=None,
-            display_label=f"{selection.cwd or 'unknown'} · {selection.short_session_id}",
+            created_at=created_at,
+            updated_at=updated_at,
+            display_label=display_label,
+            session_kind=session_kind,
+            session_label=session_label,
+            conversation_rounds=conversation_rounds,
+            warnings=warnings,
         )
 
-    def _cleanup_error_message(self, result: TrashMoveResult) -> str:
+    def _result_cleanup_error_message(self, result: TrashMoveResult) -> str:
         if result.move_error is not None:
             return f"cleanup error: {result.move_error}"
         if result.prune_error is not None:
@@ -462,7 +461,7 @@ class CodexSessionCleanerApp(App[None]):
         return "cleanup error: unknown failure"
 
     def _cleanup_failure_record(self, result: TrashMoveResult) -> SessionRecord:
-        cleanup_error = self._cleanup_error_message(result)
+        cleanup_error = self._result_cleanup_error_message(result)
         warnings = [warning for warning in result.record.warnings if not warning.startswith("cleanup error: ")]
         warnings.append(cleanup_error)
         return SessionRecord(
@@ -472,6 +471,9 @@ class CodexSessionCleanerApp(App[None]):
             created_at=result.record.created_at,
             updated_at=result.record.updated_at,
             display_label=result.record.display_label,
+            session_kind=result.record.session_kind,
+            session_label=result.record.session_label,
+            conversation_rounds=result.record.conversation_rounds,
             warnings=warnings,
         )
 
@@ -504,7 +506,6 @@ class CodexSessionCleanerApp(App[None]):
 
     def _refresh_widgets(self) -> None:
         session_list = self._query_widget("#session-list", ListView)
-        details = self._query_widget("#details", Static)
         status_line = self._query_widget("#status-line", Static)
 
         highlighted_path = self.highlighted_record_path
@@ -512,14 +513,19 @@ class CodexSessionCleanerApp(App[None]):
         effective_highlighted_path = self._effective_highlighted_path(highlighted_path)
         self.highlighted_record_path = effective_highlighted_path
 
-        if details is not None:
-            highlighted_record = self._record_for_path(effective_highlighted_path)
-            details.update(_render_details(highlighted_record) if highlighted_record else self.get_empty_state_renderable())
+        highlighted_record = self._record_for_path(effective_highlighted_path)
+        self._update_details_panel(highlighted_record)
 
         if status_line is not None:
             status_line.update(self._render_status_line())
 
-    def _query_widget(self, selector: str, widget_type: type[object]) -> object | None:
+    def _update_details_panel(self, record: SessionRecord | None) -> None:
+        details = self._query_widget("#details-pane", DetailsPane)
+        if details is None:
+            return
+        details.show_record(record, self.get_empty_state_renderable())
+
+    def _query_widget(self, selector: str, widget_type: Type[T]) -> T | None:
         try:
             return self.query_one(selector, expect_type=widget_type)
         except NoMatches:
@@ -600,7 +606,8 @@ class CodexSessionCleanerApp(App[None]):
         selected = len(self.selected_record_paths)
         base = (
             f"view: {self.view_mode} | {visible} visible of {total} total | "
-            f"{selected} selected | tab switch view | a select all | u clear all | r refresh | space toggle | d confirm | q quit"
+            f"{selected} selected | tab switch view | a select all | u clear all | r refresh | "
+            f"space toggle | pgup/pgdn details scroll | d confirm | q quit"
         )
         if self.cleanup_summary:
             return f"{base}\n{self.cleanup_summary}"
@@ -617,9 +624,7 @@ class CodexSessionCleanerApp(App[None]):
         if event.item is None:
             if self.visible_records:
                 return
-            details = self._query_widget("#details", Static)
-            if details is not None:
-                details.update(self.get_empty_state_renderable())
+            self._update_details_panel(None)
             return
 
         record = getattr(event.item, "record", None)
@@ -629,6 +634,4 @@ class CodexSessionCleanerApp(App[None]):
             return
 
         self.highlighted_record_path = record.jsonl_path
-        details = self._query_widget("#details", Static)
-        if details is not None:
-            details.update(_render_details(record))
+        self._update_details_panel(record)

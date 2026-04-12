@@ -20,6 +20,12 @@ from pathlib import Path
 
 
 @dataclass(slots=True)
+class ConversationRound:
+    user_text: str
+    assistant_text: str | None = None
+
+
+@dataclass(slots=True)
 class SessionRecord:
     session_id: str
     cwd: str | None
@@ -29,7 +35,7 @@ class SessionRecord:
     display_label: str
     session_kind: str = "main"
     session_label: str | None = None
-    conversation_preview: tuple[str, ...] = field(default_factory=tuple)
+    conversation_rounds: tuple[ConversationRound, ...] = field(default_factory=tuple)
     warnings: list[str] = field(default_factory=list)
 
 
